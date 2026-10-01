@@ -221,6 +221,7 @@ def render_wide(
     views_to_mask: list[int],
     width_factor: float,
     device: str,
+    render_index: int = 0,
 ):
     import torch
 
@@ -249,9 +250,11 @@ def render_wide(
     poses = poses.detach().float().cpu().numpy()
     if poses.shape[0] != 1:
         raise RuntimeError(f"Expected one batch of predicted poses, got {poses.shape}.")
-    fx, fy = (float(value) for value in focal[0])
+    if not 0 <= int(render_index) < view_count:
+        raise IndexError(f"render_index {render_index} is outside 0..{view_count - 1}.")
+    fx, fy = (float(value) for value in focal[int(render_index)])
     wide_k, wide_hw = wide_intrinsics_from_predicted_focal(fx, fy, (height, width), width_factor)
-    render_pose = poses[0, 0]
+    render_pose = poses[0, int(render_index)]
     identity_error = float(np.max(np.abs(render_pose - np.eye(4))))
 
     removed = 0
