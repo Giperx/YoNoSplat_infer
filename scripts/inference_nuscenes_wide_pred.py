@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """Single-frame nuScenes wide-FOV inference without ground-truth cameras.
 
-Same images as ``inference_nuscenes_wide.py`` (rear cameras 5, 4, 3), but the
-encoder is not given the nuScenes intrinsics or cam2ego poses. Camera poses
-come from the camera head (``pose_free=true``). Focal lengths come from the
-intrinsic head and are written into the ray embedding
+Rear cameras 5, 4 and 3 are stretched to the square training resolution
+(224x224) and passed to the encoder with no nuScenes intrinsics or cam2ego
+poses. Camera poses come from the camera head (``pose_free=true``). Focal
+lengths come from the intrinsic head and are written into the ray embedding
 (``use_pred_intrinsics_for_embed=true``). The head predicts only normalized
 ``fx`` and ``fy``; the principal point is not predicted and stays at 0.5.
 
-The 3x-wide intrinsics are built from the render camera's predicted focal:
+The wide intrinsics are built from the render camera's predicted focal:
 
     fx_wide = fx_pred / width_factor
     fy_wide = fy_pred
     cx = cy = 0.5
 
-``fx_pred`` is ``fx_pixels / context_width``, so dividing by the width factor
-keeps the pixel focal length and widens the horizontal field of view. ``fy``
-is unchanged because the height is unchanged. The wide view is rendered from
-the predicted pose of camera 5, which the head rebases to the identity.
+The rasterizer therefore emits a 672x224 image. That image is then stretched
+horizontally to 1176x224, the same canvas as a 392x224 input widened by 3,
+and saved under the original name.
 
 Outputs:
 
@@ -47,6 +46,9 @@ import inference_nuscenes_wide as base
 PRED_NEAR = 0.1
 PRED_FAR = 100.0
 DEFAULT_OUTPUT = ROOT / "outputs/nuscenes_wide_pred"
+MODEL_SIZE = 224
+# 224 * 1600/900 snapped to the patch size, then widened by 3.
+SAVE_WIDTH = 1176
 
 
 def placeholder_intrinsics(view_count: int) -> np.ndarray:
@@ -99,11 +101,40 @@ def wide_intrinsics_from_predicted_focal(
     return matrix, (height, wide_w)
 
 
+def stretch_image(image: Image.Image, height: int, width: int) -> np.ndarray:
+    """Resize without preserving aspect ratio. PIL size is (width, height)."""
+    if height < 1 or width < 1:
+        raise ValueError(f"Invalid stretch size {width}x{height}.")
+    resized = image.convert("RGB").resize((width, height), Image.LANCZOS)
+    array = np.asarray(resized, dtype=np.float32) / 255.0
+    if array.shape != (height, width, 3):
+        raise RuntimeError(f"Stretched image shape {array.shape} != {(height, width, 3)}.")
+    return array
+
+
+def stretch_rgb(image_hwc: np.ndarray, height: int, width: int) -> np.ndarray:
+    """Stretch a rendered RGB image. ``image_hwc`` is float in [0, 1]."""
+    if image_hwc.ndim != 3 or image_hwc.shape[2] != 3:
+        raise ValueError(f"Expected HxWx3 RGB, got {image_hwc.shape}.")
+    array = np.clip(image_hwc, 0.0, 1.0)
+    array = (array * 255.0).round().astype(np.uint8)
+    resized = Image.fromarray(array).resize((width, height), Image.LANCZOS)
+    return np.asarray(resized, dtype=np.float32) / 255.0
+
+
+def stretch_mask(mask: Image.Image, height: int, width: int) -> np.ndarray:
+    resized = mask.convert("L").resize((width, height), Image.NEAREST)
+    array = np.asarray(resized)
+    if array.shape != (height, width):
+        raise RuntimeError(f"Stretched mask shape {array.shape} != {(height, width)}.")
+    return array >= base.CAR_MASK_KEEP_THRESHOLD
+
+
 def load_frame_images(
     scene_dir: Path,
     frame: str,
     cameras: list[int],
-    plan: base.ResizeCropPlan,
+    size: int = MODEL_SIZE,
 ) -> np.ndarray:
     images = []
     for camera in cameras:
@@ -111,13 +142,30 @@ def load_frame_images(
         if not path.is_file():
             raise FileNotFoundError(path)
         with Image.open(path) as image:
-            if (image.height, image.width) != (plan.src_h, plan.src_w):
-                raise ValueError(
-                    f"{path} is {image.width}x{image.height}, expected "
-                    f"{plan.src_w}x{plan.src_h}."
-                )
-            images.append(base.apply_plan_image(image, plan))
+            images.append(stretch_image(image, size, size))
     return np.stack(images, axis=0)
+
+
+def load_stretched_keep_masks(
+    mask_root: Path,
+    cameras: list[int],
+    size: int,
+    render_index: int,
+    mask_render_view: bool,
+) -> np.ndarray:
+    keep = np.ones((len(cameras), size, size), dtype=bool)
+    for index, camera in enumerate(cameras):
+        if index == render_index and not mask_render_view:
+            continue
+        path = base.camera_mask_path(mask_root, camera)
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Missing ego-car mask for camera {camera}: {path}. "
+                "Pass --disable-car-mask to skip masking."
+            )
+        with Image.open(path) as mask:
+            keep[index] = stretch_mask(mask, size, size)
+    return keep
 
 
 def build_model(checkpoint: Path, device: str):
@@ -248,7 +296,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cameras", default="5,4,3")
     parser.add_argument("--render-camera", type=int, default=5)
     parser.add_argument("--width-factor", type=float, default=3.0)
-    parser.add_argument("--short-side", type=int, default=base.TRAIN_SHORT_SIDE)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--checkpoint", type=Path, default=base.DEFAULT_CHECKPOINT)
     parser.add_argument("--car-mask-root", type=Path, default=base.DEFAULT_MASK_ROOT)
@@ -277,22 +324,20 @@ def main(argv: list[str] | None = None) -> int:
             for index, camera in enumerate(args.cameras)
             if args.mask_render_view or camera != args.render_camera
         ]
+    if abs(args.width_factor - 3.0) > 1e-6:
+        raise SystemExit("This pipeline saves a 1176-wide image and requires --width-factor 3.")
     jobs = base.resolve_jobs(args)
-    src_hw = base.source_hw(args.data_root / jobs[0][0], jobs[0][1], args.cameras[0])
-    dst_hw = base.choose_input_hw(src_hw, short_side=args.short_side)
-    plan = base.plan_resize_and_crop(src_hw, dst_hw)
     print(
-        f"input {src_hw[1]}x{src_hw[0]} -> {plan.out_w}x{plan.out_h}, "
-        f"wide x{args.width_factor:g} from predicted focal, cameras {args.cameras}, "
-        f"jobs {len(jobs)}",
+        f"stretch input to {MODEL_SIZE}x{MODEL_SIZE}, render {MODEL_SIZE * 3}x{MODEL_SIZE}, "
+        f"save {SAVE_WIDTH}x{MODEL_SIZE}, cameras {args.cameras}, jobs {len(jobs)}",
         file=sys.stderr,
     )
     keep = None
     if views_to_mask:
-        keep = base.load_keep_masks(
+        keep = load_stretched_keep_masks(
             args.car_mask_root,
             args.cameras,
-            plan,
+            MODEL_SIZE,
             render_index=0,
             mask_render_view=args.mask_render_view,
         )
@@ -309,12 +354,12 @@ def main(argv: list[str] | None = None) -> int:
         output_path = args.output_dir / scene / "rgb" / f"{frame}_{args.render_camera}_wide.jpg"
         if args.dry_run:
             print(
-                f"dry-run {scene}/{frame}: wide K = "
-                f"[[fx/{args.width_factor:g}, 0, 0.5], [0, fy, 0.5], [0, 0, 1]] -> {output_path}",
+                f"dry-run {scene}/{frame}: {MODEL_SIZE}x{MODEL_SIZE} -> "
+                f"{SAVE_WIDTH}x{MODEL_SIZE} -> {output_path}",
                 file=sys.stderr,
             )
             continue
-        images = load_frame_images(args.data_root / scene, frame, args.cameras, plan)
+        images = load_frame_images(args.data_root / scene, frame, args.cameras, MODEL_SIZE)
         color, removed, focal, wide_k, identity_error = render_wide(
             encoder,
             decoder,
@@ -324,6 +369,9 @@ def main(argv: list[str] | None = None) -> int:
             args.width_factor,
             args.device,
         )
+        if color.shape[0] != MODEL_SIZE:
+            raise RuntimeError(f"Wide render height {color.shape[0]} != {MODEL_SIZE}.")
+        color = stretch_rgb(color, MODEL_SIZE, SAVE_WIDTH)
         base.save_jpg(output_path, color)
         if args.save_inputs:
             for index, camera in enumerate(args.cameras):
@@ -335,7 +383,7 @@ def main(argv: list[str] | None = None) -> int:
             f"{scene}/{frame}: pred fx={focal[0]:.4f} fy={focal[1]:.4f} "
             f"wide fx={wide_k[0, 0]:.4f} fy={wide_k[1, 1]:.4f} "
             f"identity_err={identity_error:.2e} removed {removed} "
-            f"rgb mean={float(color.mean()):.4f} -> {output_path}",
+            f"saved {color.shape[1]}x{color.shape[0]} mean={float(color.mean()):.4f} -> {output_path}",
             file=sys.stderr,
         )
     return 0

@@ -13,13 +13,23 @@ import inference_nuscenes_wide_pred as pred
 
 
 class PredictedWideIntrinsicsTest(unittest.TestCase):
-    def test_three_times_width_divides_only_fx(self):
-        matrix, shape = pred.wide_intrinsics_from_predicted_focal(0.50, 0.90, (224, 392), 3.0)
-        self.assertEqual(shape, (224, 1176))
-        self.assertAlmostEqual(float(matrix[0, 0]), 0.50 / 3.0)
-        self.assertAlmostEqual(float(matrix[1, 1]), 0.90)
+    def test_square_input_renders_three_times_then_saved_canvas_is_1176(self):
+        matrix, shape = pred.wide_intrinsics_from_predicted_focal(
+            0.96, 0.96, (pred.MODEL_SIZE, pred.MODEL_SIZE), 3.0
+        )
+        self.assertEqual(shape, (224, 672))
+        self.assertEqual(pred.SAVE_WIDTH, 1176)
+        self.assertAlmostEqual(float(matrix[0, 0]), 0.96 / 3.0)
+        self.assertAlmostEqual(float(matrix[1, 1]), 0.96)
         self.assertAlmostEqual(float(matrix[0, 2]), 0.5)
         self.assertAlmostEqual(float(matrix[1, 2]), 0.5)
+
+    def test_saved_image_is_stretched_to_1176_without_changing_height(self):
+        source = np.zeros((224, 672, 3), dtype=np.float32)
+        source[:, :, 0] = 1.0
+        stretched = pred.stretch_rgb(source, pred.MODEL_SIZE, pred.SAVE_WIDTH)
+        self.assertEqual(stretched.shape, (224, 1176, 3))
+        self.assertGreater(float(stretched[:, :, 0].mean()), 0.99)
 
     def test_placeholder_is_centered_and_overwritable(self):
         matrices = pred.placeholder_intrinsics(3)
