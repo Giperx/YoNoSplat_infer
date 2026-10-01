@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""Multi-frame nuScenes wide-FOV inference without ground-truth cameras.
+"""Multi-frame wide-FOV inference without ground-truth cameras.
 
+``--dataset`` selects nuScenes, Lyft 1920, Lyft 1224, DDAD, or WideDrive.
 A window is three consecutive frames by default, ordered oldest to newest.
-Each frame contributes cameras 5, 4 and 3, stretched to 224x224. No nuScenes
+Each frame contributes cameras 5, 4 and 3, stretched to 224x224. No dataset
 intrinsics or extrinsics are read. Poses and focal lengths are predicted.
 
 Only the newest frame's camera 5 is rendered. Ego-car Gaussians are removed
 everywhere except that view: every historical image, plus the current frame's
-cameras 4 and 3. The current camera 5 is kept whole.
+cameras 4 and 3. The current camera 5 is kept whole. WideDrive has no ego-car
+mask, so every Gaussian stays valid.
 
-The rasterizer emits 672x224. That image is stretched to 1176x224 and saved
-under the newest frame's original name:
+The rasterizer emits 672x224. That image is stretched to three times the
+224-high aspect width (1176 for nuScenes and Lyft 1920) and saved as:
 
     <output>/<scene>/rgb/{frame}_{render_cam}_wide.jpg
 
@@ -37,6 +39,7 @@ if str(SCRIPTS) not in sys.path:
 
 import inference_nuscenes_wide as base
 import inference_nuscenes_wide_pred as pred
+import wide_datasets as datasets
 
 DEFAULT_OUTPUT = ROOT / "outputs/nuscenes_wide_pred_multiframes"
 DEFAULT_NUM_FRAMES = 3
@@ -94,12 +97,12 @@ def views_to_mask(
 
 
 def load_camera_keep_masks(
-    mask_root: Path, cameras: list[int], size: int
+    spec: datasets.DatasetSpec, scene: str, cameras: list[int], size: int
 ) -> dict[int, np.ndarray]:
     keeps = {}
     for camera in cameras:
-        path = base.camera_mask_path(mask_root, camera)
-        if not path.is_file():
+        path = datasets.ego_mask_path(spec, camera, scene)
+        if path is None or not path.is_file():
             raise FileNotFoundError(
                 f"Missing ego-car mask for camera {camera}: {path}. "
                 "Pass --disable-car-mask to skip masking."
@@ -178,8 +181,9 @@ def resolve_jobs(args) -> list[tuple[str, tuple[str, ...]]]:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-root", type=Path, default=base.DEFAULT_DATA_ROOT)
-    parser.add_argument("--scene-list", type=Path, default=base.DEFAULT_SCENE_LIST)
+    parser.add_argument("--dataset", default="nuscenes", choices=sorted(datasets.DATASETS))
+    parser.add_argument("--data-root", type=Path, default=None)
+    parser.add_argument("--scene-list", type=Path, default=None)
     parser.add_argument("--scene", default=None)
     parser.add_argument(
         "--frame",
@@ -191,9 +195,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cameras", default="5,4,3")
     parser.add_argument("--render-camera", type=int, default=5)
     parser.add_argument("--width-factor", type=float, default=3.0)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--checkpoint", type=Path, default=base.DEFAULT_CHECKPOINT)
-    parser.add_argument("--car-mask-root", type=Path, default=base.DEFAULT_MASK_ROOT)
+    parser.add_argument("--car-mask-root", type=Path, default=None)
     parser.add_argument("--mask-render-view", action="store_true")
     parser.add_argument("--disable-car-mask", action="store_true")
     parser.add_argument("--save-inputs", action="store_true")
@@ -204,6 +208,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    spec = datasets.apply_defaults(args, multi=True)
     args.cameras = base.parse_cameras(args.cameras)
     if args.render_camera not in args.cameras:
         raise SystemExit(
@@ -212,40 +217,35 @@ def main(argv: list[str] | None = None) -> int:
     if args.num_frames < 1:
         raise SystemExit("--num-frames must be >= 1.")
     if abs(args.width_factor - 3.0) > 1e-6:
-        raise SystemExit("This pipeline saves a 1176-wide image and requires --width-factor 3.")
+        raise SystemExit("This pipeline widens by 3 and requires --width-factor 3.")
     render_index = newest_render_index(args.num_frames, args.cameras, args.render_camera)
     masked = [] if args.disable_car_mask else views_to_mask(
         args.num_frames, args.cameras, render_index, args.mask_render_view
     )
     jobs = resolve_jobs(args)
     print(
-        f"windows {args.num_frames} x cameras {args.cameras}, "
+        f"{spec.name}: windows {args.num_frames} x cameras {args.cameras}, "
         f"stretch {pred.MODEL_SIZE}x{pred.MODEL_SIZE}, "
-        f"render view {render_index}, mask {len(masked)} views, "
-        f"save {pred.SAVE_WIDTH}x{pred.MODEL_SIZE}, jobs {len(jobs)}",
+        f"render view {render_index}, mask={spec.mask_kind} ({len(masked)} views), "
+        f"jobs {len(jobs)}",
         file=sys.stderr,
     )
-    keep = None
-    if masked:
-        camera_keeps = load_camera_keep_masks(
-            args.car_mask_root, args.cameras, pred.MODEL_SIZE
-        )
-        keep = build_window_keep(
-            camera_keeps,
-            args.cameras,
-            args.num_frames,
-            render_index,
-            args.mask_render_view,
-        )
-        for index in masked:
-            removed_pixels = int((~keep[index]).sum())
-            frame_offset = index // len(args.cameras)
-            camera = args.cameras[index % len(args.cameras)]
-            print(
-                f"ego mask frame_offset {frame_offset} camera {camera}: "
-                f"remove {removed_pixels} / {keep.shape[1] * keep.shape[2]} pixels",
-                file=sys.stderr,
+    keep_cache: dict[str | None, np.ndarray] = {}
+
+    def keep_for(scene: str) -> np.ndarray | None:
+        if not masked:
+            return None
+        key = scene if spec.mask_kind == "ddad" else None
+        if key not in keep_cache:
+            camera_keeps = load_camera_keep_masks(spec, scene, args.cameras, pred.MODEL_SIZE)
+            keep_cache[key] = build_window_keep(
+                camera_keeps,
+                args.cameras,
+                args.num_frames,
+                render_index,
+                args.mask_render_view,
             )
+        return keep_cache[key]
     encoder = decoder = None
     if not args.dry_run:
         import torch
@@ -257,13 +257,21 @@ def main(argv: list[str] | None = None) -> int:
 
     for scene, window in jobs:
         newest = window[-1]
+        scene_dir = args.data_root / scene
+        save_w = datasets.save_width(
+            base.source_hw(scene_dir, newest, args.render_camera),
+            short_side=pred.MODEL_SIZE,
+            width_factor=args.width_factor,
+        )
         output_path = args.output_dir / scene / "rgb" / f"{newest}_{args.render_camera}_wide.jpg"
         if args.dry_run:
-            print(f"dry-run {scene}/{'-'.join(window)} -> {output_path}", file=sys.stderr)
+            print(
+                f"dry-run {scene}/{'-'.join(window)} -> {save_w}x{pred.MODEL_SIZE} {output_path}",
+                file=sys.stderr,
+            )
             continue
-        images = load_window_images(
-            args.data_root / scene, window, args.cameras, pred.MODEL_SIZE
-        )
+        keep = keep_for(scene)
+        images = load_window_images(scene_dir, window, args.cameras, pred.MODEL_SIZE)
         color, removed, focal, wide_k, identity_error = pred.render_wide(
             encoder,
             decoder,
@@ -276,7 +284,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if color.shape[0] != pred.MODEL_SIZE:
             raise RuntimeError(f"Wide render height {color.shape[0]} != {pred.MODEL_SIZE}.")
-        color = pred.stretch_rgb(color, pred.MODEL_SIZE, pred.SAVE_WIDTH)
+        color = pred.stretch_rgb(color, pred.MODEL_SIZE, save_w)
         base.save_jpg(output_path, color)
         if args.save_inputs:
             view_index = 0
