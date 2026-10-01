@@ -8,13 +8,44 @@
 #   https://github.com/rwightman/pytorch-image-models/tree/master/timm/models/vision_transformer.py
 
 import os
+from contextlib import contextmanager
 
 from torch import Tensor
 from torch import nn
 import torch
 
 from torch.nn.functional import scaled_dot_product_attention
-from torch.nn.attention import SDPBackend
+
+
+@contextmanager
+def _sdpa_kernel(*, flash: bool, math: bool, mem_efficient: bool):
+    """SDPA backend selection that also runs on PyTorch 2.2.
+
+    PyTorch 2.5+ exposes ``torch.nn.attention.sdpa_kernel``. 2.2 only has
+    ``torch.backends.cuda.sdp_kernel`` boolean flags. The selected backends stay
+    the same: bfloat16 uses flash, other dtypes use math plus mem-efficient.
+    """
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+    except ImportError:
+        from torch.backends.cuda import sdp_kernel
+
+        with sdp_kernel(
+            enable_flash=flash,
+            enable_math=math,
+            enable_mem_efficient=mem_efficient,
+        ):
+            yield
+        return
+    backends = []
+    if flash:
+        backends.append(SDPBackend.FLASH_ATTENTION)
+    if math:
+        backends.append(SDPBackend.MATH)
+    if mem_efficient:
+        backends.append(SDPBackend.EFFICIENT_ATTENTION)
+    with sdpa_kernel(backends[0] if len(backends) == 1 else backends):
+        yield
 
 XFORMERS_ENABLED = os.environ.get("XFORMERS_DISABLED") is None
 try:
@@ -98,10 +129,10 @@ class FlashAttention(Attention):
         q, k, v = [qkv[:,:,i] for i in range(3)]
 
         if q.dtype == torch.bfloat16:
-            with nn.attention.sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            with _sdpa_kernel(flash=True, math=False, mem_efficient=False):
                 x = scaled_dot_product_attention(q, k, v)
         else:
-            with nn.attention.sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]):
+            with _sdpa_kernel(flash=False, math=True, mem_efficient=True):
                 x = scaled_dot_product_attention(q, k, v)
 
         x = x.transpose(1, 2).reshape([B, N, C])
@@ -260,10 +291,10 @@ class FlashCrossAttentionRope(CrossAttentionRope):
             k = self.rope(k, kpos)
 
         if q.dtype == torch.bfloat16:
-            with nn.attention.sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            with _sdpa_kernel(flash=True, math=False, mem_efficient=False):
                 x = scaled_dot_product_attention(q, k, v)
         else:
-            with nn.attention.sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]):
+            with _sdpa_kernel(flash=False, math=True, mem_efficient=True):
                 x = scaled_dot_product_attention(q, k, v)
 
         x = x.transpose(1, 2).reshape(B, N, C)
@@ -373,10 +404,10 @@ class FlashAttentionRope(AttentionRope):
             k = self.rope(k, xpos)
 
         if q.dtype == torch.bfloat16:
-            with nn.attention.sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            with _sdpa_kernel(flash=True, math=False, mem_efficient=False):
                 x = scaled_dot_product_attention(q, k, v)
         else:
-            with nn.attention.sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]):
+            with _sdpa_kernel(flash=False, math=True, mem_efficient=True):
                 x = scaled_dot_product_attention(q, k, v)
 
         x = x.transpose(1, 2).reshape([B, N, C])
