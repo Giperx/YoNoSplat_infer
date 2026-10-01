@@ -215,6 +215,84 @@ def build_model(checkpoint: Path, device: str):
     return encoder, decoder
 
 
+def forward_wide_gpu(
+    encoder,
+    decoder,
+    images,
+    intrinsics,
+    remove_index,
+    render_index: int,
+    width_factor: float,
+    near,
+    far,
+):
+    """Encode every input view and render the chosen camera. Tensors stay on device.
+
+    ``images`` is ``(1, V, 3, H, W)``. ``remove_index`` is a 1-D long tensor of
+    Gaussian indices to make transparent, or ``None``. This is the timed region
+    for both one frame and a multi-frame window: the window is one forward.
+    """
+    import torch
+
+    from src.model.types import Gaussians
+
+    view_count = int(images.shape[1])
+    height, width = int(images.shape[-2]), int(images.shape[-1])
+    if not 0 <= int(render_index) < view_count:
+        raise IndexError(f"render_index {render_index} is outside 0..{view_count - 1}.")
+    dump = {}
+    gaussians = encoder(
+        {"image": images, "intrinsics": intrinsics},
+        global_step=0,
+        visualization_dump=dump,
+    )
+    expected = view_count * height * width
+    if int(gaussians.opacities.shape[-1]) != expected:
+        raise RuntimeError(
+            f"Expected one Gaussian per context pixel ({expected}), got {int(gaussians.opacities.shape[-1])}."
+        )
+    focal = dump.get("intrinsic_pred")
+    poses = dump.get("c2w")
+    if focal is None or poses is None:
+        raise RuntimeError("Encoder did not return a predicted focal and pose.")
+    focal = focal.detach().float().reshape(view_count, 2)
+    poses = poses.detach().float()
+    if poses.shape[0] != 1:
+        raise RuntimeError(f"Expected one batch of predicted poses, got {tuple(poses.shape)}.")
+    fx = focal[int(render_index), 0]
+    fy = focal[int(render_index), 1]
+    pose = poses[0, int(render_index)]
+    wide_k = torch.zeros((1, 1, 3, 3), dtype=torch.float32, device=images.device)
+    wide_k[0, 0, 0, 0] = fx / float(width_factor)
+    wide_k[0, 0, 1, 1] = fy
+    wide_k[0, 0, 0, 2] = 0.5
+    wide_k[0, 0, 1, 2] = 0.5
+    wide_k[0, 0, 2, 2] = 1.0
+    removed = 0
+    opacities = gaussians.opacities
+    if remove_index is not None and int(remove_index.numel()) > 0:
+        removed = int(remove_index.numel())
+        opacities = opacities.clone()
+        opacities.view(-1)[remove_index] = 0
+        gaussians = Gaussians(
+            gaussians.means,
+            gaussians.covariances,
+            gaussians.harmonics,
+            opacities,
+            gaussians.rotations,
+            gaussians.scales,
+        )
+    output = decoder(
+        gaussians,
+        pose[None, None],
+        wide_k,
+        near,
+        far,
+        (height, int(round(width * float(width_factor)))),
+    )
+    return output, fx, fy, wide_k[0, 0], pose, removed
+
+
 def render_wide(
     encoder,
     decoder,
@@ -227,68 +305,32 @@ def render_wide(
 ):
     import torch
 
-    from src.model.types import Gaussians
-
-    view_count, height, width = images.shape[0], images.shape[1], images.shape[2]
-    images_t = torch.from_numpy(images).permute(0, 3, 1, 2).contiguous()
-    context = {
-        "image": images_t[None].to(device),
-        "intrinsics": torch.from_numpy(placeholder_intrinsics(view_count))[None].to(device),
-    }
-    dump = {}
-    with torch.no_grad():
-        gaussians = encoder(context, global_step=0, visualization_dump=dump)
-    gaussian_count = gaussians.opacities.shape[-1]
-    expected = view_count * height * width
-    if gaussian_count != expected:
-        raise RuntimeError(
-            f"Expected one Gaussian per context pixel ({expected}), got {gaussian_count}."
-        )
-    focal = dump.get("intrinsic_pred")
-    poses = dump.get("c2w")
-    if focal is None or poses is None:
-        raise RuntimeError("Encoder did not return a predicted focal and pose.")
-    focal = focal.detach().float().cpu().numpy().reshape(view_count, 2)
-    poses = poses.detach().float().cpu().numpy()
-    if poses.shape[0] != 1:
-        raise RuntimeError(f"Expected one batch of predicted poses, got {poses.shape}.")
-    if not 0 <= int(render_index) < view_count:
-        raise IndexError(f"render_index {render_index} is outside 0..{view_count - 1}.")
-    fx, fy = (float(value) for value in focal[int(render_index)])
-    wide_k, wide_hw = wide_intrinsics_from_predicted_focal(fx, fy, (height, width), width_factor)
-    render_pose = poses[0, int(render_index)]
-    identity_error = float(np.max(np.abs(render_pose - np.eye(4))))
-
-    removed = 0
-    opacities = gaussians.opacities
+    view_count = images.shape[0]
+    images_t = torch.from_numpy(np.ascontiguousarray(images)).permute(0, 3, 1, 2).contiguous()
+    intrinsics = torch.from_numpy(placeholder_intrinsics(view_count))[None].to(device)
+    remove_index = None
     if keep is not None and views_to_mask:
         indices = base.ego_remove_indices(keep, views_to_mask)
-        removed = int(indices.size)
-        if removed:
-            opacities = opacities.clone()
-            flat = opacities.view(-1)
-            flat[torch.as_tensor(indices, device=flat.device, dtype=torch.long)] = 0
-            gaussians = Gaussians(
-                gaussians.means,
-                gaussians.covariances,
-                gaussians.harmonics,
-                opacities,
-                gaussians.rotations,
-                gaussians.scales,
-            )
+        if indices.size:
+            remove_index = torch.as_tensor(indices, device=device, dtype=torch.long)
     near = torch.full((1, 1), PRED_NEAR, dtype=torch.float32, device=device)
     far = torch.full((1, 1), PRED_FAR, dtype=torch.float32, device=device)
     with torch.no_grad():
-        output = decoder(
-            gaussians,
-            torch.from_numpy(render_pose)[None, None].to(device),
-            torch.from_numpy(wide_k)[None, None].to(device),
+        output, fx, fy, wide_k, pose, removed = forward_wide_gpu(
+            encoder,
+            decoder,
+            images_t[None].to(device),
+            intrinsics,
+            remove_index,
+            render_index,
+            width_factor,
             near,
             far,
-            wide_hw,
         )
     color = output.color[0, 0].clamp(0, 1).permute(1, 2, 0).contiguous().cpu().numpy()
-    return color, removed, (fx, fy), wide_k, identity_error
+    pose_np = pose.detach().float().cpu().numpy()
+    identity_error = float(np.max(np.abs(pose_np - np.eye(4, dtype=np.float32))))
+    return color, removed, (float(fx), float(fy)), wide_k.detach().float().cpu().numpy(), identity_error
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
