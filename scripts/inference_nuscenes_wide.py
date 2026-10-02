@@ -61,7 +61,7 @@ NUSCENES_MASK_NAME = {
 }
 
 DEFAULT_DATA_ROOT = ROOT / "datasets/nuscenes/processed_10Hz/trainval2"
-DEFAULT_SCENE_LIST = DEFAULT_DATA_ROOT / "nuScenes_Val2.txt"
+DEFAULT_SCENE_LIST = DEFAULT_DATA_ROOT / "nuScenes_Val.txt"
 DEFAULT_MASK_ROOT = ROOT / "datasets/nuscenes/nuscenes_mask"
 DEFAULT_CHECKPOINT = ROOT / "pretrained_weights/dl3dv_224x224_ctx2to32.ckpt"
 DEFAULT_OUTPUT = ROOT / "outputs/nuscenes_wide"

@@ -1,8 +1,10 @@
 """Pair YoNoSplat wide renders with height-224 sparse ground truth.
 
-The sparse GT is not in the checkout yet. Paths follow the existing
-``sparseWideFOVImages3_{width}x224`` names, and each scene is expected to
-contain ``rgb/{frame}_5_sparse_wide.png`` plus ``mask/{frame}_5_sparse_wide.png``.
+Paths follow the existing ``sparseWideFOVImages3_{width}x224`` names.
+Each scene is expected to contain ``rgb/{frame}_5_sparse_wide.png`` plus
+``mask/{frame}_5_sparse_wide.png``. WideDrive stores the same height-224
+image under camera 2, so ``{frame}_2_sparse_wide`` is accepted when the
+camera-5 file is absent.
 
 Renders:
 
@@ -176,12 +178,19 @@ def _first_existing(directory, stems):
 
 
 def find_gt(preset, gt_root, scene, frame):
-    """Return ``(rgb_path, mask_path)`` for the height-224 sparse wide GT."""
+    """Return ``(rgb_path, mask_path)`` for the height-224 sparse wide GT.
+
+    Camera 5 is the render view. WideDrive names that same image as camera 2,
+    so those stems are used only when no camera-5 file exists.
+    """
     del preset
     stems = (
         f"{frame}_5_sparse_wide",
         f"{frame}_5_wide",
         f"{frame}_5_multiplane_wide",
+        f"{frame}_2_sparse_wide",
+        f"{frame}_2_wide",
+        f"{frame}_2_multiplane_wide",
     )
     root = Path(gt_root) / scene
     return _first_existing(root / "rgb", stems), _first_existing(root / "mask", stems)

@@ -3,16 +3,18 @@
 
 ``--dataset`` selects nuScenes, Lyft 1920, Lyft 1224, DDAD, or WideDrive.
 A window is three consecutive frames by default, ordered oldest to newest.
-Each frame contributes cameras 5, 4 and 3, stretched to 224x224. No dataset
-intrinsics or extrinsics are read. Poses and focal lengths are predicted.
+Each frame contributes cameras 5, 4 and 3. By default they are stretched to
+224x224. ``--keep-aspect`` scales them uniformly to height 224 instead. No
+dataset intrinsics or extrinsics are read. Poses and focal lengths are predicted.
 
 Only the newest frame's camera 5 is rendered. Ego-car Gaussians are removed
 everywhere except that view: every historical image, plus the current frame's
 cameras 4 and 3. The current camera 5 is kept whole. WideDrive has no ego-car
 mask, so every Gaussian stays valid.
 
-The rasterizer emits 672x224. That image is stretched to three times the
-224-high aspect width (1176 for nuScenes and Lyft 1920) and saved as:
+By default the rasterizer emits 672x224 and that image is stretched to three
+times the 224-high aspect width (1176 for nuScenes and Lyft 1920).
+``--keep-aspect`` emits that saved canvas directly. Results are saved as:
 
     <output>/<scene>/rgb/{frame}_{render_cam}_wide.jpg
 
@@ -97,7 +99,11 @@ def views_to_mask(
 
 
 def load_camera_keep_masks(
-    spec: datasets.DatasetSpec, scene: str, cameras: list[int], size: int
+    spec: datasets.DatasetSpec,
+    scene: str,
+    cameras: list[int],
+    context: tuple[int, int],
+    keep_aspect: bool,
 ) -> dict[int, np.ndarray]:
     keeps = {}
     for camera in cameras:
@@ -108,7 +114,7 @@ def load_camera_keep_masks(
                 "Pass --disable-car-mask to skip masking."
             )
         with Image.open(path) as mask:
-            keeps[camera] = pred.stretch_mask(mask, size, size)
+            keeps[camera] = pred.fit_context_mask(mask, context, keep_aspect)
     return keeps
 
 
@@ -129,7 +135,11 @@ def build_window_keep(
 
 
 def load_window_images(
-    scene_dir: Path, window: tuple[str, ...], cameras: list[int], size: int
+    scene_dir: Path,
+    window: tuple[str, ...],
+    cameras: list[int],
+    context: tuple[int, int],
+    keep_aspect: bool,
 ) -> np.ndarray:
     images = []
     for frame in window:
@@ -138,7 +148,7 @@ def load_window_images(
             if not path.is_file():
                 raise FileNotFoundError(path)
             with Image.open(path) as image:
-                images.append(pred.stretch_image(image, size, size))
+                images.append(pred.fit_context_image(image, context, keep_aspect))
     return np.stack(images, axis=0)
 
 
@@ -195,6 +205,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cameras", default="5,4,3")
     parser.add_argument("--render-camera", type=int, default=5)
     parser.add_argument("--width-factor", type=float, default=3.0)
+    parser.add_argument(
+        "--keep-aspect",
+        action="store_true",
+        help=(
+            "Scale context views uniformly to height 224 instead of stretching "
+            "them to 224x224. The 3x wide render is already the saved size. "
+            "Default output is outputs/<dataset>_wide_pred_multiframes_aspect."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--checkpoint", type=Path, default=base.DEFAULT_CHECKPOINT)
     parser.add_argument("--car-mask-root", type=Path, default=None)
@@ -208,7 +227,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    explicit_output = args.output_dir is not None
     spec = datasets.apply_defaults(args, multi=True)
+    if args.keep_aspect and not explicit_output:
+        args.output_dir = pred.aspect_output_dir(args.output_dir)
     args.cameras = base.parse_cameras(args.cameras)
     if args.render_camera not in args.cameras:
         raise SystemExit(
@@ -223,21 +245,27 @@ def main(argv: list[str] | None = None) -> int:
         args.num_frames, args.cameras, render_index, args.mask_render_view
     )
     jobs = resolve_jobs(args)
+    input_mode = (
+        "aspect height 224" if args.keep_aspect else f"stretch {pred.MODEL_SIZE}x{pred.MODEL_SIZE}"
+    )
     print(
         f"{spec.name}: windows {args.num_frames} x cameras {args.cameras}, "
-        f"stretch {pred.MODEL_SIZE}x{pred.MODEL_SIZE}, "
-        f"render view {render_index}, mask={spec.mask_kind} ({len(masked)} views), "
-        f"jobs {len(jobs)}",
+        f"{input_mode}, render view {render_index}, "
+        f"mask={spec.mask_kind} ({len(masked)} views), jobs {len(jobs)}, "
+        f"output {args.output_dir}",
         file=sys.stderr,
     )
-    keep_cache: dict[str | None, np.ndarray] = {}
+    keep_cache: dict[tuple, np.ndarray] = {}
 
-    def keep_for(scene: str) -> np.ndarray | None:
+    def keep_for(scene: str, context: tuple[int, int]) -> np.ndarray | None:
         if not masked:
             return None
-        key = scene if spec.mask_kind == "ddad" else None
+        scene_key = scene if spec.mask_kind == "ddad" else ""
+        key = (scene_key, context, args.keep_aspect)
         if key not in keep_cache:
-            camera_keeps = load_camera_keep_masks(spec, scene, args.cameras, pred.MODEL_SIZE)
+            camera_keeps = load_camera_keep_masks(
+                spec, scene, args.cameras, context, args.keep_aspect
+            )
             keep_cache[key] = build_window_keep(
                 camera_keeps,
                 args.cameras,
@@ -258,20 +286,25 @@ def main(argv: list[str] | None = None) -> int:
     for scene, window in jobs:
         newest = window[-1]
         scene_dir = args.data_root / scene
+        src_hw = base.source_hw(scene_dir, newest, args.render_camera)
+        context = pred.context_hw(src_hw, args.keep_aspect)
         save_w = datasets.save_width(
-            base.source_hw(scene_dir, newest, args.render_camera),
+            src_hw,
             short_side=pred.MODEL_SIZE,
             width_factor=args.width_factor,
         )
         output_path = args.output_dir / scene / "rgb" / f"{newest}_{args.render_camera}_wide.jpg"
         if args.dry_run:
             print(
-                f"dry-run {scene}/{'-'.join(window)} -> {save_w}x{pred.MODEL_SIZE} {output_path}",
+                f"dry-run {scene}/{'-'.join(window)}: context {context[1]}x{context[0]} -> "
+                f"{save_w}x{pred.MODEL_SIZE} {output_path}",
                 file=sys.stderr,
             )
             continue
-        keep = keep_for(scene)
-        images = load_window_images(scene_dir, window, args.cameras, pred.MODEL_SIZE)
+        keep = keep_for(scene, context)
+        images = load_window_images(
+            scene_dir, window, args.cameras, context, args.keep_aspect
+        )
         color, removed, focal, wide_k, identity_error = pred.render_wide(
             encoder,
             decoder,
@@ -282,9 +315,7 @@ def main(argv: list[str] | None = None) -> int:
             args.device,
             render_index=render_index,
         )
-        if color.shape[0] != pred.MODEL_SIZE:
-            raise RuntimeError(f"Wide render height {color.shape[0]} != {pred.MODEL_SIZE}.")
-        color = pred.stretch_rgb(color, pred.MODEL_SIZE, save_w)
+        color = pred.finish_wide_color(color, save_w, args.keep_aspect)
         base.save_jpg(output_path, color)
         if args.save_inputs:
             view_index = 0

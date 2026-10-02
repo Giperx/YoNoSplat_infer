@@ -9,10 +9,12 @@ embedding. The head predicts only normalized ``fx`` and ``fy``; the principal
 point stays at 0.5.
 
 The wide intrinsics divide the render camera's predicted ``fx`` by 3 and keep
-``fy``. The rasterizer emits 672x224. That image is then stretched to three
-times the width of a 224-high, aspect-aligned frame: 1176 for nuScenes, Lyft
-1920, and WideDrive (rear cameras are 1920x1080), 798 for Lyft 1224, and 1050
-for DDAD. WideDrive camera 2 is a 5760-wide image and is not used.
+``fy``. By default the rasterizer emits 672x224, then that image is stretched
+to three times the width of a 224-high, aspect-aligned frame: 1176 for
+nuScenes, Lyft 1920, and WideDrive (rear cameras are 1920x1080), 798 for Lyft
+1224, and 1050 for DDAD. ``--keep-aspect`` scales each view uniformly to height
+224 instead, and the rasterizer emits that saved canvas directly. WideDrive
+camera 2 is a 5760-wide image and is not used.
 
 Ego-car Gaussians are removed on cameras 4 and 3. WideDrive has no ego-car
 mask, so every Gaussian stays valid. The current camera 5 is kept whole.
@@ -101,6 +103,76 @@ def wide_intrinsics_from_predicted_focal(
     return matrix, (height, wide_w)
 
 
+def context_hw(src_hw: tuple[int, int], keep_aspect: bool) -> tuple[int, int]:
+    """Encoder input ``(height, width)``.
+
+    The default is a 224x224 stretch. ``keep_aspect`` scales a landscape frame
+    so its height is 224 and snaps the width to the patch size. That width
+    times 3 is the canvas the stretch path saves, so no second resize is needed.
+    """
+    if not keep_aspect:
+        return MODEL_SIZE, MODEL_SIZE
+    src_h, src_w = int(src_hw[0]), int(src_hw[1])
+    if src_h <= 0 or src_w <= 0:
+        raise ValueError(f"Invalid source shape {src_hw}.")
+    if src_h > src_w:
+        raise ValueError(
+            f"--keep-aspect scales height to {MODEL_SIZE} and needs a landscape frame, "
+            f"got {src_h}x{src_w}."
+        )
+    height, width = base.choose_input_hw((src_h, src_w), short_side=MODEL_SIZE)
+    if height != MODEL_SIZE or width % base.PATCH_SIZE != 0:
+        raise RuntimeError(f"Aspect input {height}x{width} is not a {MODEL_SIZE}-high patch grid.")
+    return height, width
+
+
+def raster_hw(context: tuple[int, int], width_factor: float) -> tuple[int, int]:
+    """Wide render ``(height, width)`` before the optional square-input stretch."""
+    height, width = int(context[0]), int(context[1])
+    wide_w = int(round(width * float(width_factor)))
+    if height < 1 or wide_w < 1:
+        raise ValueError(f"Invalid raster size for context {context}.")
+    return height, wide_w
+
+
+def aspect_output_dir(path: Path) -> Path:
+    """Keep aspect-preserving renders out of the 224x224 output directory."""
+    return Path(path).parent / f"{Path(path).name}_aspect"
+
+
+def fit_context_image(image: Image.Image, context: tuple[int, int], keep_aspect: bool) -> np.ndarray:
+    """Stretch to a square, or uniformly scale and centre-crop to ``context``."""
+    height, width = int(context[0]), int(context[1])
+    if not keep_aspect:
+        return stretch_image(image, height, width)
+    plan = base.plan_resize_and_crop((image.height, image.width), (height, width))
+    return base.apply_plan_image(image, plan)
+
+
+def fit_context_mask(mask: Image.Image, context: tuple[int, int], keep_aspect: bool) -> np.ndarray:
+    """Resize an ego-car mask with the same geometry as ``fit_context_image``."""
+    height, width = int(context[0]), int(context[1])
+    if not keep_aspect:
+        return stretch_mask(mask, height, width)
+    plan = base.plan_resize_and_crop((mask.height, mask.width), (height, width))
+    return base.apply_plan_mask(mask, plan)
+
+
+def finish_wide_color(color: np.ndarray, save_w: int, keep_aspect: bool) -> np.ndarray:
+    """Return the saved RGB image. Aspect mode must already be ``save_w`` wide."""
+    if color.ndim != 3 or color.shape[2] != 3:
+        raise ValueError(f"Expected HxWx3 RGB, got {color.shape}.")
+    if color.shape[0] != MODEL_SIZE:
+        raise RuntimeError(f"Wide render height {color.shape[0]} != {MODEL_SIZE}.")
+    if keep_aspect:
+        if color.shape[1] != int(save_w):
+            raise RuntimeError(
+                f"Aspect render width {color.shape[1]} != saved width {save_w}."
+            )
+        return color
+    return stretch_rgb(color, MODEL_SIZE, int(save_w))
+
+
 def stretch_image(image: Image.Image, height: int, width: int) -> np.ndarray:
     """Resize without preserving aspect ratio. PIL size is (width, height)."""
     if height < 1 or width < 1:
@@ -134,7 +206,8 @@ def load_frame_images(
     scene_dir: Path,
     frame: str,
     cameras: list[int],
-    size: int = MODEL_SIZE,
+    context: tuple[int, int],
+    keep_aspect: bool,
 ) -> np.ndarray:
     images = []
     for camera in cameras:
@@ -142,7 +215,7 @@ def load_frame_images(
         if not path.is_file():
             raise FileNotFoundError(path)
         with Image.open(path) as image:
-            images.append(stretch_image(image, size, size))
+            images.append(fit_context_image(image, context, keep_aspect))
     return np.stack(images, axis=0)
 
 
@@ -150,12 +223,14 @@ def load_dataset_keep(
     spec: datasets.DatasetSpec,
     scene: str,
     cameras: list[int],
-    size: int,
+    context: tuple[int, int],
     render_index: int,
     mask_render_view: bool,
+    keep_aspect: bool,
 ) -> np.ndarray:
-    """Square keep mask. The render view stays fully valid unless requested."""
-    keep = np.ones((len(cameras), size, size), dtype=bool)
+    """Keep mask at the encoder resolution. The render view stays valid unless requested."""
+    height, width = int(context[0]), int(context[1])
+    keep = np.ones((len(cameras), height, width), dtype=bool)
     for index, camera in enumerate(cameras):
         if index == render_index and not mask_render_view:
             continue
@@ -166,7 +241,7 @@ def load_dataset_keep(
                 "Pass --disable-car-mask to skip masking."
             )
         with Image.open(path) as mask:
-            keep[index] = stretch_mask(mask, size, size)
+            keep[index] = fit_context_mask(mask, context, keep_aspect)
     return keep
 
 
@@ -344,6 +419,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cameras", default="5,4,3")
     parser.add_argument("--render-camera", type=int, default=5)
     parser.add_argument("--width-factor", type=float, default=3.0)
+    parser.add_argument(
+        "--keep-aspect",
+        action="store_true",
+        help=(
+            "Scale context views uniformly to height 224 instead of stretching "
+            "them to 224x224. The 3x wide render is already the saved size. "
+            "Default output is outputs/<dataset>_wide_pred_aspect."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--checkpoint", type=Path, default=base.DEFAULT_CHECKPOINT)
     parser.add_argument("--car-mask-root", type=Path, default=None)
@@ -357,7 +441,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    explicit_output = args.output_dir is not None
     spec = datasets.apply_defaults(args, multi=False)
+    if args.keep_aspect and not explicit_output:
+        args.output_dir = aspect_output_dir(args.output_dir)
     args.cameras = base.parse_cameras(args.cameras)
     if args.render_camera not in args.cameras:
         raise SystemExit(
@@ -376,26 +463,29 @@ def main(argv: list[str] | None = None) -> int:
     if abs(args.width_factor - 3.0) > 1e-6:
         raise SystemExit("This pipeline widens by 3 and requires --width-factor 3.")
     jobs = base.resolve_jobs(args)
+    input_mode = "aspect height 224" if args.keep_aspect else f"stretch {MODEL_SIZE}x{MODEL_SIZE}"
     print(
-        f"{spec.name}: stretch input to {MODEL_SIZE}x{MODEL_SIZE}, "
-        f"render {MODEL_SIZE * 3}x{MODEL_SIZE}, save 3x the 224-high aspect width, "
-        f"mask={spec.mask_kind}, cameras {args.cameras}, jobs {len(jobs)}",
+        f"{spec.name}: {input_mode}, save 3x the 224-high aspect width, "
+        f"mask={spec.mask_kind}, cameras {args.cameras}, jobs {len(jobs)}, "
+        f"output {args.output_dir}",
         file=sys.stderr,
     )
-    keep_cache: dict[str | None, np.ndarray] = {}
+    keep_cache: dict[tuple, np.ndarray] = {}
 
-    def keep_for(scene: str) -> np.ndarray | None:
+    def keep_for(scene: str, context: tuple[int, int]) -> np.ndarray | None:
         if not views_to_mask:
             return None
-        key = scene if spec.mask_kind == "ddad" else None
+        scene_key = scene if spec.mask_kind == "ddad" else ""
+        key = (scene_key, context, args.keep_aspect)
         if key not in keep_cache:
             keep_cache[key] = load_dataset_keep(
                 spec,
                 scene,
                 args.cameras,
-                MODEL_SIZE,
+                context,
                 render_index=0,
                 mask_render_view=args.mask_render_view,
+                keep_aspect=args.keep_aspect,
             )
         return keep_cache[key]
     encoder = decoder = None
@@ -409,21 +499,25 @@ def main(argv: list[str] | None = None) -> int:
 
     for scene, frame in jobs:
         scene_dir = args.data_root / scene
+        src_hw = base.source_hw(scene_dir, frame, args.render_camera)
+        context = context_hw(src_hw, args.keep_aspect)
         save_w = datasets.save_width(
-            base.source_hw(scene_dir, frame, args.render_camera),
+            src_hw,
             short_side=MODEL_SIZE,
             width_factor=args.width_factor,
         )
         output_path = args.output_dir / scene / "rgb" / f"{frame}_{args.render_camera}_wide.jpg"
         if args.dry_run:
             print(
-                f"dry-run {scene}/{frame}: {MODEL_SIZE}x{MODEL_SIZE} -> "
+                f"dry-run {scene}/{frame}: context {context[1]}x{context[0]} -> "
                 f"{save_w}x{MODEL_SIZE} -> {output_path}",
                 file=sys.stderr,
             )
             continue
-        keep = keep_for(scene)
-        images = load_frame_images(scene_dir, frame, args.cameras, MODEL_SIZE)
+        keep = keep_for(scene, context)
+        images = load_frame_images(
+            scene_dir, frame, args.cameras, context, args.keep_aspect
+        )
         color, removed, focal, wide_k, identity_error = render_wide(
             encoder,
             decoder,
@@ -433,9 +527,7 @@ def main(argv: list[str] | None = None) -> int:
             args.width_factor,
             args.device,
         )
-        if color.shape[0] != MODEL_SIZE:
-            raise RuntimeError(f"Wide render height {color.shape[0]} != {MODEL_SIZE}.")
-        color = stretch_rgb(color, MODEL_SIZE, save_w)
+        color = finish_wide_color(color, save_w, args.keep_aspect)
         base.save_jpg(output_path, color)
         if args.save_inputs:
             for index, camera in enumerate(args.cameras):

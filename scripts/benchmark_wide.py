@@ -7,8 +7,9 @@ queue, so the two older frames are inside the timer. FPS is output images per
 second, and each output image costs that full forward.
 
 Image loading, checkpoint loading, and the CPU resize/JPEG save are not timed.
-The timed raster is 672x224. The saved canvas (1176, 798, or 1050 wide) is
-applied only when writing images.
+The default timed raster is 672x224. The saved canvas (1176, 798, or 1050 wide)
+is applied only when writing images. ``--keep-aspect`` times the saved canvas
+directly.
 """
 
 from __future__ import annotations
@@ -67,6 +68,11 @@ def parse_args(argv=None, default_dataset="nuscenes", multi_frame=False):
     parser.add_argument("--cameras", default="5,4,3")
     parser.add_argument("--render-camera", type=int, default=5)
     parser.add_argument("--width-factor", type=float, default=3.0)
+    parser.add_argument(
+        "--keep-aspect",
+        action="store_true",
+        help="Time height-224 aspect-preserving inputs. The raster is the saved canvas.",
+    )
     parser.add_argument("--checkpoint", type=Path, default=base.DEFAULT_CHECKPOINT)
     parser.add_argument("--car-mask-root", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
@@ -125,20 +131,34 @@ def main(argv=None, default_dataset="nuscenes", multi_frame=False):
     torch.set_float32_matmul_precision("high")
     scene, window = pick_case(args)
     scene_dir = args.data_root / scene
+    src_hw = base.source_hw(scene_dir, window[-1], args.render_camera)
+    context = pred.context_hw(src_hw, args.keep_aspect)
     if args.multi:
-        images = multi.load_window_images(scene_dir, window, args.cameras, pred.MODEL_SIZE)
+        images = multi.load_window_images(
+            scene_dir, window, args.cameras, context, args.keep_aspect
+        )
         keep = None
         if masked:
-            camera_keeps = multi.load_camera_keep_masks(spec, scene, args.cameras, pred.MODEL_SIZE)
+            camera_keeps = multi.load_camera_keep_masks(
+                spec, scene, args.cameras, context, args.keep_aspect
+            )
             keep = multi.build_window_keep(
                 camera_keeps, args.cameras, args.num_frames, render_index, args.mask_render_view
             )
     else:
-        images = pred.load_frame_images(scene_dir, window[0], args.cameras, pred.MODEL_SIZE)
+        images = pred.load_frame_images(
+            scene_dir, window[0], args.cameras, context, args.keep_aspect
+        )
         keep = None
         if masked:
             keep = pred.load_dataset_keep(
-                spec, scene, args.cameras, pred.MODEL_SIZE, render_index, args.mask_render_view
+                spec,
+                scene,
+                args.cameras,
+                context,
+                render_index,
+                args.mask_render_view,
+                args.keep_aspect,
             )
     remove_index = None
     if keep is not None and masked:
@@ -197,12 +217,14 @@ def main(argv=None, default_dataset="nuscenes", multi_frame=False):
         times_ms.append(start.elapsed_time(end))
     stats = summarize(times_ms)
     mode = "multiframes" if args.multi else "single"
-    raster_w = int(round(pred.MODEL_SIZE * args.width_factor))
+    in_h, in_w = int(images.shape[1]), int(images.shape[2])
+    raster_h, raster_w = pred.raster_hw((in_h, in_w), args.width_factor)
     save_w = datasets.save_width(
-        base.source_hw(scene_dir, window[-1], args.render_camera),
+        src_hw,
         short_side=pred.MODEL_SIZE,
         width_factor=args.width_factor,
     )
+    saved_note = "raster is the saved canvas" if args.keep_aspect else "square input is stretched later"
     print(f"\n{'=' * 64}")
     print(f" Benchmark — {args.dataset} {mode}")
     print(f"{'=' * 64}")
@@ -210,9 +232,9 @@ def main(argv=None, default_dataset="nuscenes", multi_frame=False):
     print(f"  Frame:        {window[-1]}")
     print(f"  Window:       {','.join(window)}")
     print(f"  Timed region: {scope}")
-    print(f"  Input:        1 x {view_count} x 3 x {pred.MODEL_SIZE} x {pred.MODEL_SIZE}")
-    print(f"  Raster:       1 x 3 x {pred.MODEL_SIZE} x {raster_w}")
-    print(f"  Saved later:  {save_w} x {pred.MODEL_SIZE} (not timed)")
+    print(f"  Input:        1 x {view_count} x 3 x {in_h} x {in_w}")
+    print(f"  Raster:       1 x 3 x {raster_h} x {raster_w}")
+    print(f"  Saved:        {save_w} x {pred.MODEL_SIZE} ({saved_note}; save is not timed)")
     print(f"  Warmup:       {args.warmup}")
     print(f"  Measure:      {args.measure}")
     print(
@@ -229,14 +251,18 @@ def main(argv=None, default_dataset="nuscenes", multi_frame=False):
         "window": list(window),
         "views": view_count,
         "timed_region": scope,
-        "input_hw": [pred.MODEL_SIZE, pred.MODEL_SIZE],
-        "raster_hw": [pred.MODEL_SIZE, raster_w],
+        "keep_aspect": bool(args.keep_aspect),
+        "input_hw": [in_h, in_w],
+        "raster_hw": [raster_h, raster_w],
         "save_hw": [pred.MODEL_SIZE, save_w],
         "warmup": args.warmup,
         "measure": args.measure,
         **stats,
     }
-    out_path = args.output_json or (ROOT / "outputs" / "benchmarks" / f"{args.dataset}_{mode}.json")
+    suffix = "_aspect" if args.keep_aspect else ""
+    out_path = args.output_json or (
+        ROOT / "outputs" / "benchmarks" / f"{args.dataset}_{mode}{suffix}.json"
+    )
     if not out_path.is_absolute():
         out_path = ROOT / out_path
     out_path.parent.mkdir(parents=True, exist_ok=True)

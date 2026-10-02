@@ -1,6 +1,7 @@
-"""Height-224 sparse GT paths. Does not read the missing GT folders."""
+"""Height-224 sparse GT paths. Does not read the dataset GT folders."""
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -24,6 +25,30 @@ class GtPathTest(unittest.TestCase):
             self.assertEqual(preset["expected_wh"], size)
             self.assertTrue(preset["gt_root"].endswith(f"sparseWideFOVImages3_{size[0]}x224"))
             self.assertEqual(preset["style"], "sparse")
+
+    def test_camera5_gt_wins_and_widedrive_camera2_name_is_accepted(self):
+        preset = common.PRESETS["widedrive"]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scene = root / "Town01_scene_0021"
+            for kind, name in (
+                ("rgb", "000_5_sparse_wide.png"),
+                ("rgb", "000_2_sparse_wide.png"),
+                ("mask", "000_5_sparse_wide.png"),
+                ("rgb", "001_2_sparse_wide.png"),
+                ("mask", "001_2_sparse_wide.png"),
+            ):
+                directory = scene / kind
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / name).write_bytes(b"x")
+
+            rgb, mask = common.find_gt(preset, root, scene.name, "000")
+            self.assertEqual(rgb.name, "000_5_sparse_wide.png")
+            self.assertEqual(mask.name, "000_5_sparse_wide.png")
+
+            rgb, mask = common.find_gt(preset, root, scene.name, "001")
+            self.assertEqual(rgb.name, "001_2_sparse_wide.png")
+            self.assertEqual(mask.name, "001_2_sparse_wide.png")
 
 
 if __name__ == "__main__":

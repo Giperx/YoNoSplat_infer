@@ -9,6 +9,8 @@
 # Do not pass --output-dir. Metrics read:
 #   outputs/<dataset>_wide_pred
 #   outputs/<dataset>_wide_pred_multiframes
+# --keep-aspect writes the matching *_aspect directory instead. The saved
+# image size does not change; only the encoder input keeps its aspect ratio.
 #
 # Height-224 sparse GT is not required for CRCS and IPS. Photometric and
 # histogram matching are skipped until that GT directory exists.
@@ -38,6 +40,8 @@ MODE:
 
 Options:
   --skip-infer         score existing renders only
+  --keep-aspect        infer at height 224 with the native aspect
+                       and write outputs/<dataset>_wide_pred[_multiframes]_aspect
   --gt-root PATH       override the height-224 sparse GT directory
   --val-list PATH      override the scene list
 
@@ -88,6 +92,7 @@ case "$MODE" in
 esac
 
 SKIP_INFER=0
+KEEP_ASPECT=0
 GT_ROOT=""
 VAL_LIST=""
 INFER_ARGS=()
@@ -95,6 +100,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
     --skip-infer) SKIP_INFER=1; shift ;;
+    --keep-aspect) KEEP_ASPECT=1; shift ;;
     --gt-root) GT_ROOT="$(take_value "$1" "${2:-}")"; shift 2 ;;
     --gt-root=*) GT_ROOT="${1#*=}"; shift ;;
     --val-list) VAL_LIST="$(take_value "$1" "${2:-}")"; shift 2 ;;
@@ -117,6 +123,10 @@ if [[ "$MODE" == "single" ]]; then
 else
   INFER_SCRIPT="scripts/inference_nuscenes_wide_pred_multiframes.py"
   RENDER_ROOT="outputs/${DATASET}_wide_pred_multiframes"
+fi
+if [[ "$KEEP_ASPECT" -eq 1 ]]; then
+  RENDER_ROOT="${RENDER_ROOT}_aspect"
+  INFER_ARGS+=(--keep-aspect)
 fi
 
 cleanup_match_dirs() {

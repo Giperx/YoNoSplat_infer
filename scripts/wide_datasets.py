@@ -1,9 +1,10 @@
 """Dataset presets for image-only wide-FOV inference.
 
-The model always sees 224x224 stretches. The saved wide image keeps height 224
-and uses the same width rule as nuScenes: scale the native frame so its height
-is 224, snap the width to a multiple of 14, then multiply by 3. 1600x900
-therefore stays 1176 wide.
+By default the model sees 224x224 stretches. ``--keep-aspect`` instead feeds
+the 224-high aspect canvas below, and the wide render is already the saved
+size. The saved wide image keeps height 224 and uses the same width rule:
+scale the native frame so its height is 224, snap the width to a multiple of
+14, then multiply by 3. 1600x900 therefore stays 1176 wide.
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ DATASETS = {
     "nuscenes": _spec(
         "nuscenes",
         "datasets/nuscenes/processed_10Hz/trainval2",
-        "nuScenes_Val2.txt",
+        "nuScenes_Val.txt",
         "nuscenes",
         "datasets/nuscenes/nuscenes_mask",
     ),
