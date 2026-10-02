@@ -177,3 +177,7 @@ table.tex
 /test/*
 
 **/.DS_Store
+
+tmp*.md
+pretrained_weights
+.*/

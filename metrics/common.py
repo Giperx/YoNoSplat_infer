@@ -13,6 +13,7 @@ Renders:
 from __future__ import annotations
 
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -93,12 +94,28 @@ def add_common_args(parser):
     parser.add_argument("--image-dir", default="rgb")
 
 
+def _layout():
+    scripts = ROOT / "scripts"
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    import dataset_paths
+
+    return dataset_paths
+
+
 def resolve(args):
     preset = PRESETS[args.dataset]
+    layout = _layout()
     default_render = preset["multi_render"] if args.mode == "multiframes" else preset["single_render"]
     render_root = repo_path(args.render_root or default_render)
     gt_root = repo_path(args.gt_root or preset["gt_root"])
     val_list = repo_path(args.val_list or preset["val_list"])
+    gt_found = layout.locate_dir(gt_root)
+    if gt_found is not None:
+        gt_root = gt_found
+    listed = layout.locate_file(val_list)
+    if listed is not None:
+        val_list = listed
     return preset, render_root, gt_root, val_list
 
 

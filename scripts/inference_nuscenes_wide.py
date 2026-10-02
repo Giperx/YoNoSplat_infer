@@ -592,6 +592,18 @@ def main(argv: list[str] | None = None) -> int:
             if args.mask_render_view or camera != args.render_camera
         ]
 
+    scripts = Path(__file__).resolve().parent
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    import dataset_paths
+
+    args.data_root, args.scene_list, args.car_mask_root = dataset_paths.relocate_layout(
+        args.data_root,
+        args.scene_list,
+        args.car_mask_root,
+        "nuscenes",
+        need_mask=not args.disable_car_mask,
+    )
     jobs = resolve_jobs(args)
     src_hw = source_hw(args.data_root / jobs[0][0], jobs[0][1], args.cameras[0])
     dst_hw = choose_input_hw(src_hw, short_side=args.short_side)

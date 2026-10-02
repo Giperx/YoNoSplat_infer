@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+import dataset_paths
 import inference_nuscenes_wide as base
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -144,4 +145,23 @@ def apply_defaults(args, multi: bool) -> DatasetSpec:
             output_single=spec.output_single,
             output_multi=spec.output_multi,
         )
+    data_root, scene_list, mask_root = dataset_paths.relocate_layout(
+        spec.data_root,
+        spec.scene_list,
+        spec.mask_root,
+        spec.mask_kind,
+        need_mask=spec.mask_kind != "none" and not args.disable_car_mask,
+    )
+    if (data_root, scene_list, mask_root) != (spec.data_root, spec.scene_list, spec.mask_root):
+        spec = DatasetSpec(
+            name=spec.name,
+            data_root=data_root,
+            scene_list=scene_list,
+            mask_kind=spec.mask_kind,
+            mask_root=mask_root,
+            output_single=spec.output_single,
+            output_multi=spec.output_multi,
+        )
+        args.data_root = data_root
+        args.scene_list = scene_list
     return spec
