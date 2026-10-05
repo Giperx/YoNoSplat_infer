@@ -1,4 +1,4 @@
-"""Kept for comparison. ``metrics/run_wide.sh`` calls ``eval_consistency.py`` instead.
+"""Kept for comparison. ``metrics/run_wide.sh`` does not call this script.
 
 Seam low-frequency gradient on YoNoSplat wide renders. No GT image is required.
 

@@ -1,4 +1,6 @@
-"""Score wide renders with CBSR and PD. No ground truth is required.
+"""Temporarily unused. ``metrics/run_wide.sh`` does not call this script.
+
+Score wide renders with CBSR and PD. No ground truth is required.
 
 CBSR is the cross-band seam ratio (lower is better). PD is panel detail
 (higher means more local contrast). The ranking number is the mean over
