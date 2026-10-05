@@ -29,6 +29,7 @@ from common import (
     write_bucket,
 )
 from photometric import load_lpips, score_dense, score_sparse
+from summary_rows import format_metric_line, unweighted_mean
 
 try:
     from tqdm import tqdm
@@ -139,6 +140,8 @@ def main():
             "GT is the height-224 sparse wide set.",
             "Left/Right SSIM is sparse. Center SSIM is a dense window. LPIPS is Center and Center_masked.",
             "Center_masked is the GT mask AND the camera-5 ego-car mask.",
+            "Mean_LR is (Left + Right) / 2. Mean_LRC is (Left + Right + Center) / 3.",
+            "Those two rows are equal-weight averages of the region scores. Center_masked is not included.",
         ])
     else:
         meta.extend([
@@ -157,13 +160,52 @@ def main():
     with handle:
         handle.write("\n" + "=" * 80 + "\nSummary\n" + "=" * 80 + "\n")
         write_bucket(handle, keys, global_buckets, PHOTOMETRIC_NAMES, fmt_photometric)
+        if style == "sparse":
+            _write_equal_means(handle, global_buckets)
         handle.write("\n" + "=" * 80 + "\nPer-scene\n" + "=" * 80 + "\n")
         for scene in sorted(scene_buckets):
             handle.write(f"\nScene {scene}:\n")
             write_bucket(handle, keys, scene_buckets[scene], PHOTOMETRIC_NAMES, fmt_photometric, indent="  ")
+            if style == "sparse":
+                _write_equal_means(handle, scene_buckets[scene], indent="  ")
     print(f"Wrote {out_path}", flush=True)
     if scored == 0:
         raise SystemExit("no frames were scored")
+
+
+def _region_row(buckets, region):
+    rows = buckets.get(region) or []
+    values = {}
+    order = []
+    for name in PHOTOMETRIC_NAMES:
+        finite = [
+            row[name] for row in rows
+            if name in row and row[name] is not None and row[name] == row[name]
+        ]
+        if not finite:
+            continue
+        shown = fmt_photometric(name, float(sum(finite) / len(finite)))
+        if shown == "n/a":
+            continue
+        label = name.upper()
+        values[label] = float(shown)
+        order.append(label)
+    if not values:
+        return None
+    return {"n": len(rows), "values": values, "order": order, "empty": False}
+
+
+def _write_equal_means(handle, buckets, indent=""):
+    regions = {
+        "Left": _region_row(buckets, "Left"),
+        "Center": _region_row(buckets, "Center"),
+        "Right": _region_row(buckets, "Right"),
+    }
+    if any(regions[name] is None for name in ("Left", "Center", "Right")):
+        return
+    for label, names in (("Mean_LR", ("Left", "Right")), ("Mean_LRC", ("Left", "Right", "Center"))):
+        averaged = unweighted_mean([regions[name] for name in names])
+        handle.write(format_metric_line(indent, label, averaged))
 
 
 if __name__ == "__main__":

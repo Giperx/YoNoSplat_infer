@@ -192,6 +192,9 @@ run_metrics() {
   echo "CBSR and PD -> $RENDER_ROOT"
   python metrics/eval_consistency.py --dataset "$DATASET" --mode "$MODE" \
     --render-root "$RENDER_ROOT" "${val_args[@]}"
+  if [[ "$DATASET" == "lyft1920" || "$DATASET" == "lyft1224" ]]; then
+    python metrics/merge_lyft.py --render-root "$RENDER_ROOT"
+  fi
 }
 
 echo "Mode: $MODE -> $RENDER_ROOT"
