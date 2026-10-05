@@ -30,12 +30,14 @@ RENDER_RE = re.compile(r"^(\d+|Town\d+_scene_\d+|\w+)?.*?(\d+)_(\d+)_wide\.(?:jp
 FRAME_RE = re.compile(r"^(.+)_(\d+)_wide\.(?:jpg|jpeg|png|webp)$", re.IGNORECASE)
 PHOTOMETRIC_NAMES = ("psnr", "mae", "rmse", "ssim", "lpips")
 SPARSE_REGIONS = ("Left", "Center", "Center_masked", "Right", "Overall")
+DENSE_REGIONS = ("Full", "Left", "Center", "Right")
+DENSE_VARIANTS = ("unmasked", "masked")
 
 PRESETS = {
     "nuscenes": {
         "style": "sparse",
         "gt_root": "datasets/nuscenes/sparseWideFOVImages3_1176x224",
-        "val_list": "datasets/nuscenes/processed_10Hz/trainval2/nuScenes_Val2.txt",
+        "val_list": "datasets/nuscenes/processed_10Hz/trainval2/nuScenes_Val.txt",
         "single_render": "outputs/nuscenes_wide_pred",
         "multi_render": "outputs/nuscenes_wide_pred_multiframes",
         "car_mask": "datasets/nuscenes/nuscenes_mask/CAM_BACK_mask.png",
@@ -69,8 +71,8 @@ PRESETS = {
         "expected_wh": (1050, 224),
     },
     "widedrive": {
-        "style": "sparse",
-        "gt_root": "datasets/WideDrive_processed/sparseWideFOVImages3_1176x224",
+        "style": "dense",
+        "gt_root": "datasets/WideDrive_processed/WideDriveVal",
         "val_list": "datasets/WideDrive_processed/WideDriveVal/val.txt",
         "single_render": "outputs/widedrive_wide_pred",
         "multi_render": "outputs/widedrive_wide_pred_multiframes",
@@ -118,7 +120,18 @@ def resolve(args):
     listed = layout.locate_file(val_list)
     if listed is not None:
         val_list = listed
+    gt_root = _complete_gt_root(preset, gt_root)
     return preset, render_root, gt_root, val_list
+
+
+def _complete_gt_root(preset, gt_root: Path) -> Path:
+    """WideDrive scores the original camera-2 image, not the sparse wide folder."""
+    if preset.get("style") != "dense":
+        return gt_root
+    sibling = gt_root.parent / "WideDriveVal"
+    if "sparse" in gt_root.name.lower() and sibling.is_dir():
+        return sibling
+    return gt_root
 
 
 def timestamp():
@@ -178,12 +191,19 @@ def _first_existing(directory, stems):
 
 
 def find_gt(preset, gt_root, scene, frame):
-    """Return ``(rgb_path, mask_path)`` for the height-224 sparse wide GT.
+    """Return ``(rgb_path, mask_path)``. Either may be None.
 
-    Camera 5 is the render view. WideDrive names that same image as camera 2,
-    so those stems are used only when no camera-5 file exists.
+    Sparse datasets use camera 5. WideDrive stores that wide image as camera 2,
+    so those names are accepted only when no camera-5 file exists. Dense
+    WideDrive instead uses the complete camera-2 image under ``images/``.
     """
-    del preset
+    root = Path(gt_root) / scene
+    if preset.get("style") == "dense":
+        dense_stems = (f"{frame}_2", f"{frame}_2_sparse_wide", f"{frame}_5_multiplane_wide")
+        rgb = _first_existing(root / "images", (f"{frame}_2",))
+        if rgb is None:
+            rgb = _first_existing(root / "rgb", dense_stems)
+        return rgb, _first_existing(root / "mask", dense_stems)
     stems = (
         f"{frame}_5_sparse_wide",
         f"{frame}_5_wide",
@@ -192,7 +212,6 @@ def find_gt(preset, gt_root, scene, frame):
         f"{frame}_2_wide",
         f"{frame}_2_multiplane_wide",
     )
-    root = Path(gt_root) / scene
     return _first_existing(root / "rgb", stems), _first_existing(root / "mask", stems)
 
 
@@ -236,6 +255,21 @@ def strip_bounds(width):
         "Center": (third, 2 * third),
         "Right": (2 * third, width),
     }
+
+
+def dense_bounds(width):
+    """Full frame plus the same width thirds used by the sparse strips."""
+    third = width // 3
+    return {
+        "Full": (0, width),
+        "Left": (0, third),
+        "Center": (third, 2 * third),
+        "Right": (2 * third, width),
+    }
+
+
+def dense_keys():
+    return tuple(f"{region}_{variant}" for region in DENSE_REGIONS for variant in DENSE_VARIANTS)
 
 
 def fmt_photometric(name, value):

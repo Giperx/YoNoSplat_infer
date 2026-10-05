@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from common import car_mask_path, load_binary_mask, strip_bounds
+from common import car_mask_path, dense_bounds, load_binary_mask, strip_bounds
 
 
 def sparse_ssim(rendered, gt, mask, k1=0.01):
@@ -173,3 +173,25 @@ def score_sparse(render, gt, gt_mask, preset, scene, device, lpips_fn, histogram
     if overall is not None:
         results["Overall"] = overall
     return results, car_missing
+
+
+def score_dense(render, gt, gt_mask, device, lpips_fn, histogram_match):
+    """Full image plus width thirds. Masked rows are omitted when there is no GT mask."""
+    bounds = dense_bounds(render.shape[1])
+    results = {}
+    for name, (x0, x1) in bounds.items():
+        crop_r = render[:, x0:x1]
+        crop_g = gt[:, x0:x1]
+        full = np.ones(crop_r.shape[:2], dtype=bool)
+        unmasked = score_region(
+            crop_r, crop_g, full, device, lpips_fn, "dense", True, histogram_match,
+        )
+        if unmasked is not None:
+            results[f"{name}_unmasked"] = unmasked
+        if gt_mask is not None:
+            masked = score_region(
+                crop_r, crop_g, gt_mask[:, x0:x1], device, lpips_fn, "dense", True, histogram_match,
+            )
+            if masked is not None:
+                results[f"{name}_masked"] = masked
+    return results

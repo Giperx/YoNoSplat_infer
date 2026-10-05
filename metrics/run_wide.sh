@@ -42,6 +42,8 @@ Options:
   --skip-infer         score existing renders only
   --keep-aspect        infer at height 224 with the native aspect
                        and write outputs/<dataset>_wide_pred[_multiframes]_aspect
+  --tag NAME           write outputs/<dataset>_wide_pred[_multiframes]_NAME
+  --checkpoint PATH    inference checkpoint; default is the 224 dl3dv weight
   --gt-root PATH       override the height-224 sparse GT directory
   --val-list PATH      override the scene list
 
@@ -93,6 +95,8 @@ esac
 
 SKIP_INFER=0
 KEEP_ASPECT=0
+TAG=""
+CHECKPOINT=""
 GT_ROOT=""
 VAL_LIST=""
 INFER_ARGS=()
@@ -101,6 +105,10 @@ while [[ $# -gt 0 ]]; do
     -h|--help) usage; exit 0 ;;
     --skip-infer) SKIP_INFER=1; shift ;;
     --keep-aspect) KEEP_ASPECT=1; shift ;;
+    --tag) TAG="$(take_value "$1" "${2:-}")"; shift 2 ;;
+    --tag=*) TAG="${1#*=}"; shift ;;
+    --checkpoint) CHECKPOINT="$(take_value "$1" "${2:-}")"; shift 2 ;;
+    --checkpoint=*) CHECKPOINT="${1#*=}"; shift ;;
     --gt-root) GT_ROOT="$(take_value "$1" "${2:-}")"; shift 2 ;;
     --gt-root=*) GT_ROOT="${1#*=}"; shift ;;
     --val-list) VAL_LIST="$(take_value "$1" "${2:-}")"; shift 2 ;;
@@ -127,6 +135,17 @@ fi
 if [[ "$KEEP_ASPECT" -eq 1 ]]; then
   RENDER_ROOT="${RENDER_ROOT}_aspect"
   INFER_ARGS+=(--keep-aspect)
+fi
+if [[ -n "$TAG" ]]; then
+  if [[ ! "$TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "tag must be letters, numbers, dot, underscore, or dash: $TAG" >&2
+    exit 1
+  fi
+  RENDER_ROOT="${RENDER_ROOT}_${TAG}"
+fi
+if [[ -n "$CHECKPOINT" && ! -f "$CHECKPOINT" ]]; then
+  echo "checkpoint not found: $CHECKPOINT" >&2
+  exit 1
 fi
 
 cleanup_match_dirs() {
@@ -179,12 +198,18 @@ run_metrics() {
 }
 
 echo "Mode: $MODE -> $RENDER_ROOT"
+if [[ -n "$CHECKPOINT" ]]; then
+  echo "Checkpoint: $CHECKPOINT"
+fi
 if [[ "$SKIP_INFER" -eq 0 ]]; then
   echo "Inference -> $INFER_SCRIPT --dataset $DATASET"
-  if ((${#INFER_ARGS[@]})); then
-    python "$INFER_SCRIPT" --dataset "$DATASET" "${INFER_ARGS[@]}"
-  else
-    python "$INFER_SCRIPT" --dataset "$DATASET"
+  launch=(python "$INFER_SCRIPT" --dataset "$DATASET" --output-dir "$RENDER_ROOT")
+  if [[ -n "$CHECKPOINT" ]]; then
+    launch+=(--checkpoint "$CHECKPOINT")
   fi
+  if ((${#INFER_ARGS[@]})); then
+    launch+=("${INFER_ARGS[@]}")
+  fi
+  "${launch[@]}"
 fi
 run_metrics
