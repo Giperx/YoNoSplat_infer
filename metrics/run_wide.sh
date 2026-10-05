@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Inference, then photometric / HM / CRCS / IPS, for one YoNoSplat dataset.
+# Inference, then photometric / HM / CBSR / PD, for one YoNoSplat dataset.
 #
 #   conda activate yonosplat
 #   bash metrics/run_wide.sh nuscenes single
@@ -12,8 +12,8 @@
 # --keep-aspect writes the matching *_aspect directory instead. The saved
 # image size does not change; only the encoder input keeps its aspect ratio.
 #
-# Height-224 sparse GT is not required for CRCS and IPS. Photometric and
-# histogram matching are skipped until that GT directory exists.
+# CBSR and PD do not use GT. Photometric and histogram matching are skipped
+# until that GT directory exists. eval_crcs.py and eval_ips.py are not called.
 # After the dataset finishes, per-scene match/ and matched_img/ are removed.
 #
 # FPS is separate and times the whole forward, including every frame of a
@@ -189,12 +189,9 @@ run_metrics() {
   else
     echo "GT root missing, skip photometric/HM: $GT_ROOT" >&2
   fi
-  echo "CRCS -> $RENDER_ROOT"
-  python metrics/eval_crcs.py --dataset "$DATASET" --mode "$MODE" \
-    --render-root "$RENDER_ROOT" --gt-root "$GT_ROOT" "${val_args[@]}"
-  echo "IPS -> $RENDER_ROOT"
-  python metrics/eval_ips.py --dataset "$DATASET" --mode "$MODE" \
-    --render-root "$RENDER_ROOT" --gt-root "$GT_ROOT" "${val_args[@]}"
+  echo "CBSR and PD -> $RENDER_ROOT"
+  python metrics/eval_consistency.py --dataset "$DATASET" --mode "$MODE" \
+    --render-root "$RENDER_ROOT" "${val_args[@]}"
 }
 
 echo "Mode: $MODE -> $RENDER_ROOT"

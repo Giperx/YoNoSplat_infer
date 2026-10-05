@@ -1,4 +1,6 @@
-"""Seam low-frequency gradient on YoNoSplat wide renders. No GT image is required.
+"""Kept for comparison. ``metrics/run_wide.sh`` calls ``eval_consistency.py`` instead.
+
+Seam low-frequency gradient on YoNoSplat wide renders. No GT image is required.
 
 IPS is the mean horizontal gradient of a Gaussian low-pass, on the 0-255
 scale, at the left and right third-boundaries. The primary score is unmasked.

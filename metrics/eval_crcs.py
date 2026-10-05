@@ -1,4 +1,6 @@
-"""Color-seam step on YoNoSplat wide renders. No GT image is required.
+"""Kept for comparison. ``metrics/run_wide.sh`` calls ``eval_consistency.py`` instead.
+
+Color-seam step on YoNoSplat wide renders. No GT image is required.
 
 CRCS is the mean absolute horizontal color step, in 0-255 units, at the left
 and right third-boundaries and over the whole image. The primary score is
