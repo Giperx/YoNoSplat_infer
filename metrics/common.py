@@ -125,11 +125,17 @@ def resolve(args):
 
 
 def _complete_gt_root(preset, gt_root: Path) -> Path:
-    """WideDrive scores the original camera-2 image, not the sparse wide folder."""
+    """Use WideDriveVal for the single-pinhole sparse-wide folder only.
+
+    A multiplane directory also contains ``sparse``. It is a different image
+    and must not be replaced by the camera-2 source frames.
+    """
     if preset.get("style") != "dense":
         return gt_root
+    if "sparsewidefov" not in gt_root.name.lower():
+        return gt_root
     sibling = gt_root.parent / "WideDriveVal"
-    if "sparse" in gt_root.name.lower() and sibling.is_dir():
+    if sibling.is_dir():
         return sibling
     return gt_root
 

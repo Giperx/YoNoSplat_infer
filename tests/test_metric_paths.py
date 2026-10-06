@@ -39,6 +39,9 @@ class GtPathTest(unittest.TestCase):
             full.mkdir()
             self.assertEqual(common._complete_gt_root(preset, sparse), full)
             self.assertEqual(common._complete_gt_root(preset, full), full)
+            multiplane = root / "sparseMultiplaneImages3_672x224"
+            multiplane.mkdir()
+            self.assertEqual(common._complete_gt_root(preset, multiplane), multiplane)
 
     def test_dense_gt_uses_the_complete_camera2_image(self):
         preset = common.PRESETS["widedrive"]

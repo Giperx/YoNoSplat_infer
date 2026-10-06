@@ -27,6 +27,7 @@ Outputs:
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -101,6 +102,51 @@ def wide_intrinsics_from_predicted_focal(
         dtype=np.float32,
     )
     return matrix, (height, wide_w)
+
+
+def plane_fov(fx_norm: float) -> float:
+    """Full horizontal field of view, in radians, for a centered principal point."""
+    fx_norm = float(fx_norm)
+    if fx_norm <= 0:
+        raise ValueError(f"Predicted fx must be positive, got {fx_norm}.")
+    return 2.0 * math.atan(0.5 / fx_norm)
+
+
+def multiplane_c2w(center: np.ndarray, fx_norm: float) -> np.ndarray:
+    """Return ``(3, 4, 4)`` poses in panorama order Left, Center, Right.
+
+    The yaw matches ``gen_wide_gt/multiPlanesWIdeFOV``. The left plane is
+    ``R @ Ry_pos`` and the right plane is ``R @ Ry_neg``. Translation stays on
+    the main camera, so the three planes are co-centric. ``fx_norm`` is the
+    predicted normalized focal and the principal point is 0.5.
+    """
+    center = np.asarray(center, dtype=np.float32)
+    if center.shape != (4, 4):
+        raise ValueError(f"Expected a 4x4 pose, got {center.shape}.")
+    alpha = plane_fov(fx_norm)
+    cosine, sine = math.cos(alpha), math.sin(alpha)
+    ry_pos = np.array(
+        [[cosine, 0.0, -sine], [0.0, 1.0, 0.0], [sine, 0.0, cosine]],
+        dtype=np.float32,
+    )
+    ry_neg = np.array(
+        [[cosine, 0.0, sine], [0.0, 1.0, 0.0], [-sine, 0.0, cosine]],
+        dtype=np.float32,
+    )
+    left = center.copy()
+    right = center.copy()
+    left[:3, :3] = center[:3, :3] @ ry_pos
+    right[:3, :3] = center[:3, :3] @ ry_neg
+    return np.stack([left, center, right], axis=0)
+
+
+def stitch_planes(planes: np.ndarray) -> np.ndarray:
+    """Join ``(3, H, W, 3)`` planes into one ``(H, 3W, 3)`` panorama."""
+    if planes.ndim != 4 or planes.shape[0] != 3 or planes.shape[-1] != 3:
+        raise ValueError(f"Expected 3 HxWx3 planes, got {planes.shape}.")
+    if len({tuple(plane.shape) for plane in planes}) != 1:
+        raise ValueError("Multiplane views must share one size.")
+    return np.concatenate([planes[0], planes[1], planes[2]], axis=1)
 
 
 def context_hw(src_hw: tuple[int, int], keep_aspect: bool) -> tuple[int, int]:
@@ -406,6 +452,132 @@ def render_wide(
     pose_np = pose.detach().float().cpu().numpy()
     identity_error = float(np.max(np.abs(pose_np - np.eye(4, dtype=np.float32))))
     return color, removed, (float(fx), float(fy)), wide_k.detach().float().cpu().numpy(), identity_error
+
+
+def forward_multiplane_gpu(
+    encoder,
+    decoder,
+    images,
+    intrinsics,
+    remove_index,
+    render_index: int,
+    near,
+    far,
+):
+    """Encode once, then render Left, Center, and Right from the predicted pose.
+
+    The center plane is the predicted main camera. Left and right yaw that same
+    predicted pose by its predicted horizontal field of view. Each plane keeps
+    the predicted focal. Nothing here reads a dataset extrinsic.
+    """
+    import torch
+
+    from src.model.types import Gaussians
+
+    view_count = int(images.shape[1])
+    height, width = int(images.shape[-2]), int(images.shape[-1])
+    if not 0 <= int(render_index) < view_count:
+        raise IndexError(f"render_index {render_index} is outside 0..{view_count - 1}.")
+    dump = {}
+    gaussians = encoder(
+        {"image": images, "intrinsics": intrinsics},
+        global_step=0,
+        visualization_dump=dump,
+    )
+    expected = view_count * height * width
+    if int(gaussians.opacities.shape[-1]) != expected:
+        raise RuntimeError(
+            f"Expected one Gaussian per context pixel ({expected}), got {int(gaussians.opacities.shape[-1])}."
+        )
+    focal = dump.get("intrinsic_pred")
+    poses = dump.get("c2w")
+    if focal is None or poses is None:
+        raise RuntimeError("Encoder did not return a predicted focal and pose.")
+    focal = focal.detach().float().reshape(view_count, 2)
+    poses = poses.detach().float()
+    if poses.shape[0] != 1:
+        raise RuntimeError(f"Expected one batch of predicted poses, got {tuple(poses.shape)}.")
+    fx = focal[int(render_index), 0]
+    fy = focal[int(render_index), 1]
+    pose = poses[0, int(render_index)]
+    planes = torch.from_numpy(
+        multiplane_c2w(pose.detach().float().cpu().numpy(), float(fx))
+    ).to(device=images.device, dtype=torch.float32)
+    view_k = torch.zeros((1, 3, 3, 3), dtype=torch.float32, device=images.device)
+    view_k[:, :, 0, 0] = fx
+    view_k[:, :, 1, 1] = fy
+    view_k[:, :, 0, 2] = 0.5
+    view_k[:, :, 1, 2] = 0.5
+    view_k[:, :, 2, 2] = 1.0
+    removed = 0
+    opacities = gaussians.opacities
+    if remove_index is not None and int(remove_index.numel()) > 0:
+        removed = int(remove_index.numel())
+        opacities = opacities.clone()
+        opacities.view(-1)[remove_index] = 0
+        gaussians = Gaussians(
+            gaussians.means,
+            gaussians.covariances,
+            gaussians.harmonics,
+            opacities,
+            gaussians.rotations,
+            gaussians.scales,
+        )
+    output = decoder(
+        gaussians,
+        planes[None],
+        view_k,
+        near.expand(1, 3).contiguous(),
+        far.expand(1, 3).contiguous(),
+        (height, width),
+    )
+    return output, fx, fy, pose, removed
+
+
+def render_multiplane(
+    encoder,
+    decoder,
+    images: np.ndarray,
+    keep: np.ndarray | None,
+    views_to_mask: list[int],
+    device: str,
+    render_index: int = 0,
+):
+    """Return the stitched Left | Center | Right panorama and the predicted focal."""
+    import torch
+
+    view_count = images.shape[0]
+    images_t = torch.from_numpy(np.ascontiguousarray(images)).permute(0, 3, 1, 2).contiguous()
+    intrinsics = torch.from_numpy(placeholder_intrinsics(view_count))[None].to(device)
+    remove_index = None
+    if keep is not None and views_to_mask:
+        indices = base.ego_remove_indices(keep, views_to_mask)
+        if indices.size:
+            remove_index = torch.as_tensor(indices, device=device, dtype=torch.long)
+    near = torch.full((1, 1), PRED_NEAR, dtype=torch.float32, device=device)
+    far = torch.full((1, 1), PRED_FAR, dtype=torch.float32, device=device)
+    with torch.no_grad():
+        output, fx, fy, pose, removed = forward_multiplane_gpu(
+            encoder,
+            decoder,
+            images_t[None].to(device),
+            intrinsics,
+            remove_index,
+            render_index,
+            near,
+            far,
+        )
+    planes = np.stack(
+        [
+            output.color[0, index].clamp(0, 1).permute(1, 2, 0).contiguous().cpu().numpy()
+            for index in range(3)
+        ],
+        axis=0,
+    )
+    color = stitch_planes(planes)
+    pose_np = pose.detach().float().cpu().numpy()
+    identity_error = float(np.max(np.abs(pose_np - np.eye(4, dtype=np.float32))))
+    return color, removed, (float(fx), float(fy)), identity_error, plane_fov(float(fx))
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
