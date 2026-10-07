@@ -142,6 +142,9 @@ def main():
             "Center_masked is the GT mask AND the camera-5 ego-car mask.",
             "Mean_LR is (Left + Right) / 2. Mean_LRC is (Left + Right + Center) / 3.",
             "Those two rows are equal-weight averages of the region scores. Center_masked is not included.",
+            "Without histogram matching, Mean_LRC SSIM mixes Left/Right sparse SSIM with Center window SSIM.",
+            "With histogram matching, HM_SSIM is the per-pixel score after matching, including Center.",
+            "Mean_LRC HM_SSIM averages that value. Mean_LRC SSIM stays the mixed Center-window number.",
         ])
     else:
         meta.extend([
@@ -156,16 +159,17 @@ def main():
         f"Val-list scenes without a render directory: {len(missing_scenes)}.",
         f"Scored frames: {scored} / {len(jobs)}.",
     ])
+    metric_names = PHOTOMETRIC_NAMES + ("hm_ssim",) if style == "sparse" else PHOTOMETRIC_NAMES
     handle = open_report(out_path, f"YoNoSplat wide {tag}", meta)
     with handle:
         handle.write("\n" + "=" * 80 + "\nSummary\n" + "=" * 80 + "\n")
-        write_bucket(handle, keys, global_buckets, PHOTOMETRIC_NAMES, fmt_photometric)
+        write_bucket(handle, keys, global_buckets, metric_names, fmt_photometric)
         if style == "sparse":
             _write_equal_means(handle, global_buckets)
         handle.write("\n" + "=" * 80 + "\nPer-scene\n" + "=" * 80 + "\n")
         for scene in sorted(scene_buckets):
             handle.write(f"\nScene {scene}:\n")
-            write_bucket(handle, keys, scene_buckets[scene], PHOTOMETRIC_NAMES, fmt_photometric, indent="  ")
+            write_bucket(handle, keys, scene_buckets[scene], metric_names, fmt_photometric, indent="  ")
             if style == "sparse":
                 _write_equal_means(handle, scene_buckets[scene], indent="  ")
     print(f"Wrote {out_path}", flush=True)
@@ -177,7 +181,8 @@ def _region_row(buckets, region):
     rows = buckets.get(region) or []
     values = {}
     order = []
-    for name in PHOTOMETRIC_NAMES:
+    names = PHOTOMETRIC_NAMES + ("hm_ssim",) if any("hm_ssim" in row for row in rows) else PHOTOMETRIC_NAMES
+    for name in names:
         finite = [
             row[name] for row in rows
             if name in row and row[name] is not None and row[name] == row[name]
